@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import logging
 from flask import Flask, request, jsonify
 import requests
@@ -45,7 +44,7 @@ if missing_vars:
 
 # Configure LLM client (ensure you have langchain-openai installed)
 try:
-    llm = ChatOpenAI(model="gpt-4.1", temperature=0.2, api_key=OPENAI_API_KEY)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=OPENAI_API_KEY)
 except Exception as e:
     app.logger.error(f"Error initializing OpenAI client: {e}")
     exit(1)
@@ -346,171 +345,125 @@ def post_review_comment_tool(
 
 # --- CrewAI Setup ---
 
-
-
-# --- Keep all your existing code above this line ---
-# (Imports, Flask setup, Logging, Env Vars, LLM/GitHub clients, Tool definitions)
-
-# --- Constants for Severity Scoring (Add these near the top) ---
-IMPROVEMENT_OPPORTUNITY_SCORE = 1 # Minor style, best practice suggestions
-ALERT_SCORE = 3                 # Potential issues, non-critical bugs, performance hints
-PROBLEM_SCORE = 5                 # Likely bugs, security concerns, critical issues
-
-
-# --- Refactored CrewAI Setup ---
-
 def setup_crewai_agents_and_tasks(repo_full_name: str, pr_number: int, commit_sha: str):
-    """Creates the CrewAI Agents and Tasks for code review, including severity and Portuguese comments."""
-    app.logger.info(f"Setting up CrewAI agents and tasks for PR #{pr_number} (Commit: {commit_sha[:7]})")
+    """Creates the CrewAI Agents and Tasks for code review."""
+    app.logger.info("Setting up CrewAI agents and tasks...")
 
-    # --- Define Improved Agents ---
-
+    # Define Agents
     code_analyzer = Agent(
-        role='Expert Code Quality and Security Analyst',
-        goal=f"""Analyze code patches (diffs) with meticulous detail, focusing ONLY on added lines (starting with '+').
-        Identify issues across multiple dimensions: correctness, style, performance, security, and leftover artifacts.
-        Assign a severity score ({IMPROVEMENT_OPPORTUNITY_SCORE}=Improvement, {ALERT_SCORE}=Alert, {PROBLEM_SCORE}=Problem) and categorize each finding.
-        Provide clear, actionable feedback IN ENGLISH.""", # Specify English output for analysis consistency
-        backstory=f"""You are a highly experienced software architect and security expert integrated into a single analysis unit.
-        You have assimilated the knowledge of specialized reviewers (general quality, security, performance).
-        Your mandate is to scrutinize *new* code lines within diffs to ensure they adhere to the highest standards of quality,
-        security, and maintainability. You provide precise, constructive feedback IN ENGLISH, prioritized by potential impact, using a
-        {IMPROVEMENT_OPPORTUNITY_SCORE}/{ALERT_SCORE}/{PROBLEM_SCORE} scoring system.""",
+        role='Code Analyzer',
+        goal="Analyze code patches (diffs) for potential issues like bugs, style inconsistencies, "
+             "performance concerns, security vulnerabilities, and leftover debugging code (e.g., 'console.log', 'debugger'). "
+             "Focus specifically on lines added (lines starting with '+').",
+        backstory="You are an expert code reviewer with a keen eye for detail. You meticulously scan code changes "
+                  "to ensure high quality, maintainability, and correctness, focusing only on the changes introduced.",
         verbose=True,
         llm=llm,
-        allow_delegation=False # Focused analysis, no delegation needed
+        allow_delegation=False # This agent shouldn't delegate
     )
 
     github_commenter = Agent(
-        role='GitHub Review Integration Specialist (pt-BR)',
-        goal=f"""Receive structured code analysis findings (line content, English comment, severity, category).
-        Accurately determine the diff position for each finding using tools.
-        Translate the English comment into clear, constructive Brazilian Portuguese (pt-BR).
-        Format and post findings as review comments in Portuguese on the specified GitHub PR, prefixed with severity indicators.
-        Use tools effectively for positioning and posting.""",
-        backstory="""Você é um especialista em automação responsável por integrar a análise de código ao feedback do desenvolvedor no GitHub.
-        Você traduz meticulosamente os relatórios de análise (originalmente em inglês) para o português brasileiro (pt-BR)
-        e os transforma em comentários acionáveis, posicionados precisamente no contexto do diff do PR.
-        Você utiliza ferramentas para interagir com a API do GitHub e garante que o feedback,
-        marcado com sua severidade e traduzido para pt-BR, chegue ao desenvolvedor de forma eficiente.""", # Backstory in Portuguese for flavour
+        role='GitHub Comment Formatter and Poster',
+        goal="Receive code analysis findings, determine the correct diff position for each finding, "
+             "and post them as review comments on the specified GitHub Pull Request using the available tools.",
+        backstory="You are a meticulous assistant responsible for translating code analysis feedback into actionable "
+                  "GitHub comments. You use tools precisely to post comments in the right place on the Pull Request.",
         verbose=True,
         llm=llm,
-        tools=[find_diff_position_tool, post_review_comment_tool], # Tools remain the same
-        allow_delegation=False # Directly uses tools
+        tools=[find_diff_position_tool, post_review_comment_tool], # Assign the tools!
+        allow_delegation=False # This agent executes the posting
     )
 
-    # --- Define Improved Tasks ---
-
-    # Task 1: Analyze a single file's patch (Output remains English JSON)
+    # Define Tasks
+    # Task 1: Analyze a single file's patch
     analyze_file_patch_task = Task(
         description=f"""Analyze the provided code patch for the file '{{file_path}}'.
         The patch content represents the changes made to this file in Pull Request #{pr_number} of repository {repo_full_name}.
-        Focus *exclusively* on lines starting with '+' (added lines).
-
         Patch content:
         ```diff
         {{patch_content}}
         ```
+        Your goal is to identify potential issues ONLY in the added lines (those starting with '+').
+        Look for:
+        - Bugs or logical errors
+        - Poor coding practices or style issues
+        - Performance optimizations opportunities
+        - Security vulnerabilities
+        - Leftover debug statements (console.log, print, debugger, etc.)
 
-        **Analysis Goals:**
-        Identify potential issues in the ADDED lines related to:
-        1.  **Correctness & Bugs:** Logical errors, off-by-one, null references, race conditions, etc.
-        2.  **Security:** Vulnerabilities (Injection, XSS, insecure data handling, etc.). Reference OWASP Top 10.
-        3.  **Performance:** Inefficiencies, potential memory leaks, suboptimal algorithms in new code.
-        4.  **Style & Best Practices:** Style guide violations, complexity, magic numbers, naming.
-        5.  **Leftover Artifacts:** Debug code (console.log, print, debugger, TODOs), commented-out code.
+        For EACH issue found, provide the following information clearly:
+        1.  `problematic_line_content`: The EXACT, complete line of code (including the leading '+') where the issue is found. Do NOT summarize or rephrase the line.
+        2.  `comment_body`: A concise explanation of the issue and a concrete suggestion for improvement. Be specific and constructive.
 
-        **Output Format:**
-        For EACH distinct issue found in an added line, provide the following information in a JSON list of dictionaries:
-        1.  `problematic_line_content`: The EXACT, complete line of code (including '+').
-        2.  `severity_score`: Assign a score: {PROBLEM_SCORE} (Problem), {ALERT_SCORE} (Alert), {IMPROVEMENT_OPPORTUNITY_SCORE} (Improvement).
-        3.  `category`: A brief English category name (e.g., "Security", "Performance", "Style", "Bug Risk", "Debug Code").
-        4.  `comment_body`: A concise explanation of the issue AND a concrete suggestion for improvement, written in ENGLISH.
-
-        If an issue spans multiple added lines, associate it with the *first* relevant added line.
-        If no issues are found, return an empty list: `[]`.
+        If no issues are found in the added lines, state that explicitly.
         """,
-        expected_output=f"""A JSON list of dictionaries adhering strictly to the specified format. The 'comment_body' MUST be in English.
-        Example:
+        expected_output=f"""A JSON list of dictionaries, where each dictionary represents a single issue found.
+        Each dictionary MUST contain the keys 'problematic_line_content' and 'comment_body'.
+        Example for one issue found:
         ```json
         [
           {{
-            "problematic_line_content": "+ console.log('Debug data:', data); // TODO: Remove",
-            "severity_score": {ALERT_SCORE},
-            "category": "Debug Code",
-            "comment_body": "Leftover 'console.log' statement and a TODO comment indicate debugging code that should be removed before merge."
-          }},
-          {{
-            "problematic_line_content": "+ dangerous_input = request.args.get('param')",
-            "severity_score": {PROBLEM_SCORE},
-            "category": "Security",
-            "comment_body": "Potential Security Risk: Directly using user input from 'request.args.get' without sanitization can lead to vulnerabilities if used in sensitive operations (e.g., database queries, command execution)."
+            "problematic_line_content": "+ console.log('User data:', userData);",
+            "comment_body": "Leftover 'console.log' statement. Please remove this debugging code before merging."
           }}
         ]
         ```
-        If no issues are found: `[]`
+        If no issues are found, return an empty list: `[]`.
         """,
         agent=code_analyzer,
-        # This task outputs the analysis structure in English JSON
+        # This task does not directly use external tools, it analyzes text.
     )
 
-    # Task 2: Post comments based on analysis results (Translate and Post in Portuguese)
+    # Task 2: Post comments based on analysis results for that file
     post_file_comments_task = Task(
-        description=f"""Process the JSON list of identified code issues for the file '{{file_path}}', received from the Code Analyzer.
-        The input contains dictionaries with 'problematic_line_content', 'severity_score', 'category', and 'comment_body' (in English).
-        Use the provided tools ('find_diff_position_tool', 'post_review_comment_tool') to post these findings as comments IN BRAZILIAN PORTUGUESE (pt-BR) on GitHub Pull Request #{pr_number} in repository {repo_full_name}.
+        description=f"""Process the list of identified issues for the file '{{file_path}}' received from the Code Analyzer.
+        The list contains dictionaries, each with 'problematic_line_content' and 'comment_body'.
+        The full patch content for the file is also provided below.
+        You must use the available tools ('find_diff_position_tool' and 'post_review_comment_tool') to post these comments to GitHub.
 
-        **Input:** The JSON output from the analysis task.
         **Context for Tools:**
         - Repository: {repo_full_name}
         - Pull Request Number: {pr_number}
         - Commit SHA: {commit_sha}
         - File Path: {{file_path}}
 
-        **Full Patch Content (for position finding):**
+        **Patch Content for Position Finding:**
         ```diff
         {{patch_content}}
         ```
 
-        **Execution Steps for EACH issue in the input list:**
-        1.  Extract `problematic_line_content`, `severity_score`, `category` (English), and `comment_body` (English).
-        2.  **Determine Severity Prefix and Portuguese Category:**
-            - If `severity_score` == {PROBLEM_SCORE}, prefix = "[PROBLEMA]" and infer Portuguese category (e.g., "Segurança").
-            - If `severity_score` == {ALERT_SCORE}, prefix = "[ALERTA]" and infer Portuguese category (e.g., "Código de Debug").
-            - If `severity_score` == {IMPROVEMENT_OPPORTUNITY_SCORE}, prefix = "[SUGESTÃO]" and infer Portuguese category (e.g., "Estilo").
-            - Otherwise, use no prefix and the English category translated.
-        3.  **Translate the Comment:** Translate the original English `comment_body` into clear, constructive, and actionable Brazilian Portuguese (pt-BR).
-        4.  **Construct Final Comment:** Create the final comment string IN PORTUGUESE. It should follow the structure: `"[Severity Prefix] (Portuguese Category): Translated Comment Body"`, using the determined prefix, translated category, and translated comment body.
-        5.  Use `find_diff_position_tool` with the `patch_content` and the exact `problematic_line_content` to get the line position.
-        6.  Use `post_review_comment_tool` with the required parameters, providing the final PORTUGUESE comment body constructed in step 4 and the found `diff_position`. Handle position finding failures (-1) by passing `diff_position=None` to post a general comment.
+        **For each issue in the analysis results list:**
+        1.  Extract the `problematic_line_content` and `comment_body`.
+        2.  Use the `find_diff_position_tool` with the provided `patch_content` and the exact `problematic_line_content` to get the line position in the diff.
+        3.  Use the `post_review_comment_tool`:
+            - Provide `repo_full_name`: "{repo_full_name}"
+            - Provide `pr_number`: {pr_number}
+            - Provide `commit_sha`: "{commit_sha}"
+            - Provide `filename`: "{{file_path}}"
+            - Provide `comment_body`: The extracted `comment_body`.
+            - Provide `diff_position`: The position returned by `find_diff_position_tool`. If the tool returns -1 or an error occurs finding the position, pass `diff_position=None` or `diff_position=-1` to `post_review_comment_tool` so it posts a general comment for that file.
 
-        Execute the posting for ALL identified issues individually.
+        Execute the posting for ALL identified issues.
         """,
-        expected_output=f"""A concise summary report IN ENGLISH detailing the outcome of posting each comment for file '{{file_path}}'.
-        For each comment attempt, state whether it was successfully posted (in-line or general) or if an error occurred. Include the Portuguese severity prefix/category in the report description.
-        Example Output:
-        - [SUGESTÃO] (Estilo) Comment ('Nit de estilo: Considere adicionar espaços...'): Successfully posted in-line comment on {{file_path}} at position X.
-        - [ALERTA] (Código de Debug) Comment ('Instrução de print de debug remanescente...'): Successfully posted in-line comment on {{file_path}} at position Y.
-        - [PROBLEMA] (Segurança) Comment ('[CRÍTICO] Possível vulnerabilidade de Command Injection...'): Posted as general comment regarding {{file_path}} (position finding failed).
-        - [ALERTA] (Performance) Comment ('Loop ineficiente...'): Error posting comment: GitHub API error 403 - Forbidden.
+        expected_output=f"""A summary report detailing the outcome of attempting to post each comment for file '{{file_path}}'.
+        For each comment, indicate whether it was posted successfully (in-line or general) or if an error occurred.
+        Example:
+        - Comment 1 ('Leftover console.log...'): Successfully posted in-line comment on {{file_path}} at position 15.
+        - Comment 2 ('Potential null pointer...'): Posted as general comment regarding {{file_path}} (position finding failed).
+        - Comment 3 ('Inefficient loop...'): Error posting comment: GitHub API error 404 - Not Found.
         """,
         agent=github_commenter,
-        context=[analyze_file_patch_task], # Depends on the English analysis results
-        # Tools are assigned to the agent.
+        context=[analyze_file_patch_task], # Depends on the output of the analysis task
+        # Tools are assigned to the agent, this task will utilize them.
     )
 
     # Create and return the Crew
-    app.logger.info("CrewAI agents and tasks setup complete.")
     return Crew(
         agents=[code_analyzer, github_commenter],
         tasks=[analyze_file_patch_task, post_file_comments_task],
         process=Process.sequential, # Run analysis then posting for each file
-        verbose=True
+        verbose=True # Enable verbose mode for detailed logs
     )
-
-# --- Keep all your existing code below this line ---
-
-# (Flask webhook handler, main execution block)
 
 # --- Flask Webhook Handler ---
 
@@ -547,18 +500,21 @@ def github_webhook():
             app.logger.info(f"Ignoring event for draft PR #{pr_number} in {repo_full_name}.")
             return jsonify({"message": "Ignoring draft pull request"}), 200
 
-        app.logger.info(f"Processing '{action}' event for PR #{pr_number} in {repo_full_name}")
+        app.logger.info(f"Processing {action} event for PR #{pr_number} in {repo_full_name}")
 
         try:
-            # 1. Get changed files and context
-            file_context = get_changed_files_tool.func(repo_full_name=repo_full_name, pr_number=pr_number)
+            # 1. Get changed files and context using the tool
+            #    (We call it directly here to get data needed for looping and setup)
+            # Access the original function via the .func attribute
+            file_context = get_changed_files_tool.func(repo_full_name=repo_full_name, pr_number=pr_number) 
 
             if file_context["error"]:
                 app.logger.error(f"Failed to get changed files: {file_context['error']}")
+                # Optionally post a comment about the failure
                 try:
                     repo = github_client.get_repo(repo_full_name)
                     pr = repo.get_pull(pr_number)
-                    pr.create_issue_comment(f"⚠️ **Erro na Revisão por IA:**\n\nNão foi possível obter as alterações de arquivos para análise.\nErro: `{file_context['error']}`")
+                    pr.create_issue_comment(f"⚠️ AI Review Error: Could not retrieve file changes for analysis. Error: {file_context['error']}")
                 except Exception as comment_err:
                     app.logger.error(f"Failed to post error comment: {comment_err}")
                 return jsonify({"error": file_context["error"]}), 500
@@ -569,141 +525,71 @@ def github_webhook():
 
             if not changed_files:
                 app.logger.info("No relevant file changes detected in the PR.")
+                # Optionally post a comment indicating no files were reviewed
                 try:
                     repo = github_client.get_repo(repo_full_name)
                     pr = repo.get_pull(pr_number)
-                    pr.create_issue_comment("ℹ️ **Revisão por IA:** Nenhum arquivo de código relevante encontrado para revisar nesta atualização.")
+                    pr.create_issue_comment("ℹ️ AI Review: No relevant code files found to review in this update.")
                 except Exception as comment_err:
                     app.logger.error(f"Failed to post 'no files' comment: {comment_err}")
                 return jsonify({"message": "No relevant files to review"}), 200
-
+                
             if not last_commit_sha:
                  app.logger.error("Cannot proceed with commenting without the last commit SHA.")
+                 # Post general comment about failure
                  try:
                     repo = github_client.get_repo(repo_full_name)
                     pr = repo.get_pull(pr_number)
-                    pr.create_issue_comment("⚠️ **Erro na Revisão por IA:**\n\nNão foi possível determinar o SHA do último commit. Não é possível postar comentários com precisão.")
+                    pr.create_issue_comment("⚠️ AI Review Error: Could not determine the latest commit SHA. Unable to post comments accurately.")
                  except Exception as comment_err:
                     app.logger.error(f"Failed to post commit SHA error comment: {comment_err}")
                  return jsonify({"error": "Missing commit SHA"}), 500
 
-            # 2. Setup CrewAI
+
+            # 2. Setup CrewAI (now depends on commit_sha)
             review_crew = setup_crewai_agents_and_tasks(repo_full_name, pr_number, last_commit_sha)
 
-            # --- Refined Initialization for Summary ---
-            overall_severity_counts = {
-                'PROBLEMA': 0,
-                'ALERTA': 0,
-                'SUGESTÃO': 0
-            }
-            files_analyzed_count = 0
-            files_with_errors = []
-            # Optional: Store detailed posting results if needed later
-            # detailed_posting_results = []
-
-            app.logger.info(f"Starting analysis of {len(changed_files)} files for commit {last_commit_sha[:7]}...")
-
             # 3. Iterate and Run Crew for each file
+            app.logger.info(f"Starting analysis of {len(changed_files)} files...")
+            all_results = []
+            files_analyzed_count = 0
+
             for file_info in changed_files:
                 filename = file_info['filename']
                 patch_content = patches_dict.get(filename)
 
                 if not patch_content:
-                    app.logger.warning(f"Patch content missing for {filename}. Skipping.")
+                    app.logger.warning(f"Patch content missing for {filename} in collected data. Skipping.")
                     continue
 
                 app.logger.info(f"\n--- Analyzing file: {filename} ---")
-                crew_inputs = {'file_path': filename, 'patch_content': patch_content}
-                analysis_task_output = None # Initialize for this file
+
+                # Prepare inputs for the Crew kickoff for this specific file
+                crew_inputs = {
+                    'file_path': filename,
+                    'patch_content': patch_content
+                    # Context needed by the second task's tools is embedded in the task description
+                    # or handled by tools themselves (like fetching PR object).
+                }
 
                 try:
                     # Kick off the crew for this file
-                    # The 'result' here is the output of the *last* task (commenter summary)
-                    posting_result_summary = review_crew.kickoff(inputs=crew_inputs)
-                    app.logger.info(f"--- Crew finished for file: {filename} ---")
-                    app.logger.debug(f"Commenter Task Output for {filename}: {posting_result_summary}")
-                    # detailed_posting_results.append({"file": filename, "summary": posting_result_summary})
-
-                    # --- Correctly Access Analyzer Task Output ---
-                    # Assuming analyze_file_patch_task is the first task (index 0)
-                    if review_crew.tasks and len(review_crew.tasks) > 0:
-                        analyzer_task = review_crew.tasks[0]
-                        if hasattr(analyzer_task, 'output') and analyzer_task.output:
-                             # Access the raw output which should be the JSON string or already parsed data
-                             analysis_task_output = analyzer_task.output.raw_output if hasattr(analyzer_task.output, 'raw_output') else str(analyzer_task.output)
-                             app.logger.debug(f"Analyzer Task Raw Output for {filename}: {analysis_task_output}")
-                        else:
-                             app.logger.warning(f"Analyzer task output not found or empty for {filename}.")
-                    else:
-                         app.logger.warning(f"No tasks found in crew after execution for {filename}.")
-
-                    # --- Process the Analyzer's Findings ---
-                    if analysis_task_output:
-                        try:
-                            findings = []
-                            # Attempt to parse if it's a string
-                            if isinstance(analysis_task_output, str):
-                                # Clean potential markdown code blocks
-                                cleaned_output = re.sub(r'^```json\s*|\s*```$', '', analysis_task_output, flags=re.MULTILINE).strip()
-                                if cleaned_output:
-                                    try:
-                                        findings = json.loads(cleaned_output)
-                                    except json.JSONDecodeError as json_err:
-                                        app.logger.error(f"Failed to decode JSON from analyzer output for {filename}: {json_err}. Output was: {cleaned_output}")
-                                        findings = [] # Reset findings on error
-                                else:
-                                     app.logger.warning(f"Cleaned analyzer output string is empty for {filename}.")
-
-                            elif isinstance(analysis_task_output, list):
-                                findings = analysis_task_output # Already a list
-                            else:
-                                 app.logger.warning(f"Unexpected type for analyzer output for {filename}: {type(analysis_task_output)}")
-
-
-                            # Ensure findings is a list before iterating
-                            if isinstance(findings, list):
-                                file_severity_counts = {'PROBLEMA': 0, 'ALERTA': 0, 'SUGESTÃO': 0}
-                                for finding in findings:
-                                    if isinstance(finding, dict):
-                                        severity = finding.get('severity_score')
-                                        if severity == PROBLEM_SCORE:
-                                            overall_severity_counts['PROBLEMA'] += 1
-                                            file_severity_counts['PROBLEMA'] += 1
-                                        elif severity == ALERT_SCORE:
-                                            overall_severity_counts['ALERTA'] += 1
-                                            file_severity_counts['ALERTA'] += 1
-                                        elif severity == IMPROVEMENT_OPPORTUNITY_SCORE:
-                                            overall_severity_counts['SUGESTÃO'] += 1
-                                            file_severity_counts['SUGESTÃO'] += 1
-                                        else:
-                                            app.logger.warning(f"Unknown severity score '{severity}' in finding for {filename}: {finding}")
-                                    else:
-                                         app.logger.warning(f"Finding item is not a dictionary in {filename}: {finding}")
-                                app.logger.info(f"Severity counts for {filename}: {file_severity_counts}")
-                            else:
-                                app.logger.warning(f"Processed findings for {filename} is not a list: {type(findings)}")
-
-                        except Exception as proc_err:
-                            app.logger.error(f"Error processing findings for {filename}: {proc_err}", exc_info=True)
-                            files_with_errors.append(filename + " (processing error)")
-                    else:
-                         app.logger.warning(f"No valid analysis output to process for {filename}")
-
+                    result = review_crew.kickoff(inputs=crew_inputs)
+                    app.logger.info(f"--- Finished analyzing file: {filename} ---")
+                    app.logger.info(f"Result for {filename}: {result}") # Result is the output of the LAST task
+                    all_results.append({filename: result})
                     files_analyzed_count += 1
-
                 except Exception as file_error:
-                    app.logger.error(f"Error running CrewAI workflow for file {filename}: {file_error}", exc_info=True)
-                    files_with_errors.append(filename + " (workflow error)")
+                    app.logger.error(f"Error running CrewAI for file {filename}: {file_error}", exc_info=True)
                     # Attempt to post a general comment about the failure for this file
                     try:
                         error_comment_body = (
-                            f"**⚠️ Erro na Revisão por IA para `{filename}`:**\n\n"
-                            f"O processo de revisão encontrou um erro inesperado ao analisar este arquivo.\n"
-                            f"Detalhes: `{str(file_error)}`\n\n"
-                            f"Por favor, revise este arquivo manualmente."
+                            f"**⚠️ AI Review Error for `{filename}`:**\n\n"
+                            f"The AI review process encountered an unexpected error while analyzing this file.\n"
+                            f"Error details: `{str(file_error)}`\n\n"
+                            f"Please review this file manually."
                         )
-                        # Use the tool directly for error reporting
-                        post_review_comment_tool.func(
+                        post_review_comment_tool.func( # Use the tool directly for error reporting
                              repo_full_name=repo_full_name,
                              pr_number=pr_number,
                              commit_sha=last_commit_sha, # Use the SHA we have
@@ -712,67 +598,36 @@ def github_webhook():
                              diff_position=None # Post as general comment
                         )
                     except Exception as comment_error:
-                        app.logger.error(f"Failed to post error comment for {filename} after workflow error: {comment_error}", exc_info=True)
+                        app.logger.error(f"Failed to post error comment for {filename}: {comment_error}", exc_info=True)
 
 
-            # --- Improved Final Summary Comment ---
-            app.logger.info(f"Final overall severity counts: {overall_severity_counts}")
-            total_findings_identified = sum(overall_severity_counts.values())
-
-            summary_lines = [
-                f"### ✅ Revisão por IA Concluída",
-                f"**Commit:** `{last_commit_sha[:7]}`",
-                f"**Arquivos Analisados:** {files_analyzed_count} de {len(changed_files)} relevantes",
-                "",
-                f"**📊 Resumo da Análise:**",
-                f"- **{overall_severity_counts['PROBLEMA']}** [PROBLEMA]: Questões críticas ou bugs prováveis.",
-                f"- **{overall_severity_counts['ALERTA']}** [ALERTA]: Possíveis problemas, performance ou código de debug.",
-                f"- **{overall_severity_counts['SUGESTÃO']}** [SUGESTÃO]: Oportunidades de melhoria de estilo ou boas práticas.",
-                f"- **Total de Pontos Identificados:** {total_findings_identified}",
-            ]
-
-            if files_with_errors:
-                 summary_lines.append("\n**⚠️ Atenção:**")
-                 summary_lines.append(f"Ocorreram erros ao processar os seguintes arquivos (verifique os logs e revise manualmente):")
-                 for f_err in files_with_errors:
-                      summary_lines.append(f"- `{f_err}`")
-
-            summary_message = "\n".join(summary_lines)
-
+            # 4. Optional: Post a summary comment after all files are processed
+            summary_message = f"✅ AI Code Review Completed.\n\nAnalyzed {files_analyzed_count} file(s)."
+            # You could potentially aggregate results from `all_results` for a more detailed summary
+            # For now, just a completion notice.
             try:
                 repo = github_client.get_repo(repo_full_name)
                 pr = repo.get_pull(pr_number)
                 pr.create_issue_comment(summary_message)
-                app.logger.info("Posted improved overall completion summary comment.")
+                app.logger.info("Posted overall completion summary comment.")
             except Exception as summary_comment_error:
                 app.logger.error(f"Failed to post final summary comment: {summary_comment_error}", exc_info=True)
 
-            return jsonify({
-                "message": "Review process completed",
-                "files_analyzed": files_analyzed_count,
-                "total_findings": total_findings_identified,
-                "severity_counts": overall_severity_counts,
-                "files_with_errors": files_with_errors
-                }), 200
+
+            return jsonify({"message": "Review process completed", "files_analyzed": files_analyzed_count}), 200
 
         except GithubException as e:
             error_msg = f"A GitHub API error occurred during processing: {e.status} - {e.data}"
             app.logger.error(error_msg, exc_info=True)
-            # Attempt to post error on PR
-            try:
-                 repo = github_client.get_repo(repo_full_name)
-                 pr = repo.get_pull(pr_number)
-                 pr.create_issue_comment(f"⚠️ **Erro Crítico na Revisão por IA:**\n\nOcorreu um erro de API do GitHub ({e.status}) que impediu a conclusão da revisão.\nErro: `{e.data.get('message', 'Detalhes não disponíveis')}`")
-            except Exception: pass
             return jsonify({"error": error_msg}), 500
         except Exception as e:
             error_msg = f"An unexpected error occurred during the review process: {e}"
             app.logger.error(error_msg, exc_info=True)
             # Attempt to post a general error comment if possible
             try:
-                 repo = github_client.get_repo(repo_full_name)
-                 pr = repo.get_pull(pr_number)
-                 pr.create_issue_comment(f"⚠️ **Erro Crítico no Sistema de Revisão por IA:**\n\nOcorreu um erro inesperado: `{e}`.\nA revisão pode estar incompleta. Verifique os logs do sistema.")
+                 repo = github_client.get_repo(repo_full_name) # Might fail if repo_full_name wasn't set yet
+                 pr = repo.get_pull(pr_number) # Might fail if pr_number wasn't set yet
+                 pr.create_issue_comment(f"⚠️ AI Review System Error: An unexpected critical error occurred: {e}. Review may be incomplete.")
             except Exception:
                  pass # Ignore error during final error reporting
             return jsonify({"error": error_msg}), 500
@@ -785,6 +640,6 @@ def github_webhook():
 
 if __name__ == "__main__":
     # Make sure to set HOST and PORT via environment variables or config if needed
-    port = int(os.getenv("PORT", 5000)) # Default to 5000 if not set
-    app.logger.info(f"Starting Flask server on http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False) # Set debug=False for production
+    port = int(os.getenv("PORT", 5000))
+    app.logger.info(f"Starting Flask server on port {port}...")
+    app.run(host="0.0.0.0", port=port) # Use 0.0.0.0 to be accessible externally
