@@ -4,5 +4,5 @@ python-dotenv==1.0.1
 crewai==0.108.0
 langchain==0.1.12
 langchain-openai==0.0.8
-requests==2.31.0
+requests==2.32.4
 crewai-tools==0.1.7 
